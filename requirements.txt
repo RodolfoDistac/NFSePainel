@@ -1,3 +1,4 @@
 PySimpleGUI==4.70.1
 pyodbc
 python-dotenv
+oracledb>=3.4,<4.0

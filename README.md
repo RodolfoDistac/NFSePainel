@@ -9,3 +9,10 @@ Painel visual para **ler, filtrar e exportar** NFS-e (XML ABRASF e variações).
 
 ## Estrutura do projeto
 
+
+
+ #  git add .
+ #  git commit -m "Sua mensagem de commit"
+ #  git push
+ #  .\.venv\Scripts\Activate.ps1
+ #  python main.py

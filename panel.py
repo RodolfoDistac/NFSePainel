@@ -18,6 +18,7 @@ from services.parcelas import (
     parse_dd_mm_aaaa,
     aplicar_parcelas_e_acumuladores,
 )
+from ui.login_baixa_integrada import show_login_baixa_integrada
 
 # ---------------- Config e constantes ----------------
 
@@ -35,6 +36,9 @@ DEFAULT_EXPORT_DIR = SETTINGS.export_dir
 
 # Overrides de credenciais Sybase (definido pelo "Login empresa", por sessão)
 G_SYBASE_CFG: Optional[Mapping[str, str]] = None
+
+# Empresa selecionada (Oracle CAD / Domínio)
+G_EMPRESA_SEL: Optional[Dict[str, str]] = None
 
 
 # ---------------- Utilitários ----------------
@@ -66,7 +70,6 @@ def _brl_to_decimal(s: str | None) -> Decimal:
     t = str(s).strip()
     if not t:
         return Decimal("0")
-    # Heurística: se tiver ponto e vírgula, remove milhares e normaliza decimal
     if "," in t and "." in t:
         t = t.replace(".", "").replace(",", ".")
     else:
@@ -107,7 +110,6 @@ def _parse_all(input_str: str) -> Tuple[List[Dict[str, Any]], Dict[str, int], Li
         counts["total"] += 1
         try:
             r = parser.parse(xml_bytes, name).to_row()
-            # Sanitiza documento do tomador (só dígitos) para evitar divergências nas buscas/comparações
             r["TOMADOR"] = _digits_only(r.get("TOMADOR"))
             rows.append(r)
             counts["ok"] += 1
@@ -134,7 +136,6 @@ def _apply_filter(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]
     return [r for r in rows if match(r)]
 
 def _parse_brl_number(s: str) -> float:
-    # usado apenas para ordenação; float é suficiente aqui
     s = str(s or "").strip()
     if not s:
         return 0.0
@@ -153,7 +154,6 @@ def _sort_rows(rows: List[Dict[str, Any]], col_idx: int, ascending: bool) -> Lis
     return sorted(rows, key=keyfunc, reverse=not ascending)
 
 def _make_row_colors(rows: List[Dict[str, Any]]):
-    # pinta linhas com STATUS="Cancelada" em vermelho claro
     colors = []
     for idx, r in enumerate(rows):
         if str(r.get("STATUS", "")).lower() == "cancelada":
@@ -161,11 +161,7 @@ def _make_row_colors(rows: List[Dict[str, Any]]):
     return colors
 
 def _autosize_table(table_elem: sg.Table, values: List[List[str]], headings: List[str]) -> None:
-    """
-    Ajusta a largura (px) de cada coluna com base no maior conteúdo + cabeçalho.
-    Limites: 60..600 px; padding: +24 px. DISCRIMINACAO pode 'stretch'.
-    """
-    tv = table_elem.Widget  # ttk.Treeview
+    tv = table_elem.Widget
     try:
         import tkinter.font as tkfont
         f = tkfont.nametofont("TkDefaultFont")
@@ -189,29 +185,25 @@ def _autosize_table(table_elem: sg.Table, values: List[List[str]], headings: Lis
             pass
 
 def _compare_rows(a: Dict[str, str], b: Dict[str, str]) -> bool:
-    """Compara linhas do painel vs Domínio (campos de valor/aliq/iss/taxas)."""
     keys = ["VALOR","ALIQ","INSS","IR","PIS","COFINS","CSLL","ISS_RET","ISS_NORMAL"]
     for k in keys:
         if (a.get(k) or "").strip() != (b.get(k) or "").strip():
             return False
     return True
 
-# -------- Totais dinâmicos (linhas visíveis) --------
 def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, str]:
     totals: Dict[str, Decimal] = {k: Decimal("0") for k in _NUMERIC_COLS}
     for r in rows:
-        # canceladas já vêm zeradas pelos parsers/export; se não, somamos como estiver na grid
         for k in _NUMERIC_COLS:
             totals[k] += _brl_to_decimal(r.get(k))
-    # formata para BRL
     return {k: _decimal_to_brl(v) for k, v in totals.items()}
 
 
 # ---------------- Login (Domínio) ----------------
 
 def _login_dialog() -> Optional[Mapping[str, str]]:
-    """Abre diálogo para informar credenciais do Domínio e testar conexão. Retorna dict se 'Aplicar'."""
-    # Valores iniciais do .env
+    from utils.logs import log_emit, create_gui_sink, format_record  # safe import se usado fora do main
+
     base = to_env_dict(SETTINGS.sybase)
     layout = [
         [sg.Text("Conexão Domínio (SQL Anywhere / Sybase)", font=("Segoe UI", 11, "bold"))],
@@ -226,7 +218,7 @@ def _login_dialog() -> Optional[Mapping[str, str]]:
          sg.Button("Aplicar (sessão)", key="-APPLY-"),
          sg.Button("Cancelar", key="-CLOSE-")]
     ]
-    w = sg.Window("Login empresa", layout, modal=True, finalize=True)
+    w = sg.Window("Login empresa (manual)", layout, modal=True, finalize=True)
     cfg: Optional[Mapping[str, str]] = None
     while True:
         ev, vals = w.read()
@@ -235,7 +227,7 @@ def _login_dialog() -> Optional[Mapping[str, str]]:
             break
         if ev == "-TEST-":
             try:
-                import pyodbc  # garante msg clara se faltar driver/lib
+                import pyodbc
             except Exception as e:
                 sg.popup_error("pyodbc não está disponível.\nInstale os requisitos e o driver ODBC do SQL Anywhere.\n\n" + str(e))
                 continue
@@ -340,7 +332,7 @@ def _show_clientes_window(encontrados: List[Dict[str, str]], nao_encontrados: Li
 
         if ev == "-COPY-NF-":
             try:
-                import pyperclip  # opcional
+                import pyperclip
                 pyperclip.copy(notf)
                 sg.popup_ok("Copiado para a área de transferência.")
             except Exception:
@@ -354,7 +346,6 @@ def _show_clientes_window(encontrados: List[Dict[str, str]], nao_encontrados: Li
 
 
 def _show_nfse_dominio_window(dominio_rows: List[Dict[str, str]], painel_rows: List[Dict[str, str]]) -> None:
-    """Mostra NFS-e vindas do Domínio e um status de conciliação com o que está no painel."""
     idx_painel = {(r.get("NFE"), r.get("TOMADOR")): r for r in painel_rows}
 
     enriched: List[Dict[str, str]] = []
@@ -412,12 +403,6 @@ def _show_nfse_dominio_window(dominio_rows: List[Dict[str, str]], painel_rows: L
 
 
 def _parcelas_dialog() -> Optional[str]:
-    """
-    Janela do assistente de parcelas.
-    - Sugere o vencimento padrão (último dia do mês anterior ao do sistema).
-    - Permite alterar antes de aplicar.
-    Retorna a data (dd-mm-aaaa) ou None se cancelar.
-    """
     padrao = format_dd_mm_aaaa(calcular_vencimento_padrao())
     layout = [
         [sg.Text("Gerar 1 parcela para cada NF (linhas visíveis).")],
@@ -437,7 +422,7 @@ def _parcelas_dialog() -> Optional[str]:
             if not d:
                 sg.popup_error("Data inválida. Use o formato dd-mm-aaaa, por exemplo 30-09-2025.")
                 continue
-            venc = format_dd_mm_aaaa(d)  # normaliza
+            venc = format_dd_mm_aaaa(d)
             break
     w.close()
     return venc
@@ -452,7 +437,6 @@ def _make_window(theme: Optional[str] = None) -> sg.Window:
     sg.set_options(dpi_awareness=True, scaling=scale, font=("Segoe UI", 10))
     win_size = (int(sw * 0.9), int(sh * 0.9))
 
-    # Barra de ações
     bar_actions = [[
         sg.Button("Login empresa", key="-LOGIN-"),
         sg.Button("Importar XMLs", key="-LOAD-BAR-"),
@@ -501,7 +485,6 @@ def _make_window(theme: Optional[str] = None) -> sg.Window:
         sg.Text("  Falha:"), sg.Text("0", key="-FAIL-"),
     ]
 
-    # ---- NOVO: barra de totais dinâmicos (linhas visíveis) ----
     totals_labels = [
         ("VALOR", "-TVAL-"), ("ALIQ", "-TALIQ-"), ("INSS", "-TINSS-"), ("IR", "-TIR-"),
         ("PIS", "-TPIS-"), ("COFINS", "-TCOF-"), ("CSLL", "-TCSLL-"),
@@ -553,7 +536,7 @@ def _make_window(theme: Optional[str] = None) -> sg.Window:
     return window
 
 def _attach_header_sort(window: sg.Window) -> None:
-    tv = window["-TABLE-"].Widget  # ttk.Treeview
+    tv = window["-TABLE-"].Widget
     for i, col in enumerate(COLUMNS):
         try:
             tv.heading(str(i), text=col, command=lambda c=i: window.write_event_value("-SORT-", c))
@@ -564,10 +547,17 @@ def _attach_header_sort(window: sg.Window) -> None:
 # ---------------- Main / Loop de eventos ----------------
 
 def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
-    from utils.logs import log_emit
+    global G_SYBASE_CFG, G_EMPRESA_SEL  # globais
+
+    # Importa utilitários de log (agora com sink assíncrono)
+    from utils.logs import create_gui_sink, log_emit, format_record
     from dataio.exporters import export_csv
 
     window = _make_window(theme)
+
+    # Sink de logs assíncronos: evento customizado "-LOGEVT-"
+    SINK = create_gui_sink(window, multiline_key="-LOG-", event_key="-LOGEVT-")
+
     all_rows: List[Dict[str, Any]] = []
     view_rows: List[Dict[str, Any]] = []
     sort_state = {"col": None, "asc": True}
@@ -611,6 +601,15 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
             break
 
         try:
+            # -------- Evento de Log assíncrono ----------
+            if event == "-LOGEVT-":
+                rec = values.get(event, {})
+                try:
+                    window["-LOG-"].print(format_record(rec))
+                except Exception:
+                    pass
+                continue
+
             # -------- Importação ----------
             if event in ("-LOAD-", "-LOAD-BAR-"):
                 raw = values.get("-INPUT-", "")
@@ -632,7 +631,7 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
                 kind, payload = values[event]
                 if kind == "error":
                     msg = str(payload)
-                    log_emit(window["-LOG-"], "error", "processamento_falhou", detalhe=msg)
+                    log_emit(SINK, "error", "processamento_falhou", detalhe=msg)
                     window["-STATUS-"].update("Falhou.")
                     sg.popup_error(f"Falha no processamento:\n{msg}")
                     continue
@@ -648,11 +647,11 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
                 window["-OK-"].update(str(counts.get("ok", 0)))
                 window["-FAIL-"].update(str(counts.get("fail", 0)))
 
-                log_emit(window["-LOG-"], "info", "processamento_concluido", **counts)
+                log_emit(SINK, "info", "processamento_concluido", **counts)
                 for err in errors[:50]:
-                    log_emit(window["-LOG-"], "error", "falha_parse", detalhe=err)
+                    log_emit(SINK, "error", "falha_parse", detalhe=err)
                 if len(errors) > 50:
-                    log_emit(window["-LOG-"], "warn", "erros_suprimidos", restantes=len(errors) - 50)
+                    log_emit(SINK, "warn", "erros_suprimidos", restantes=len(errors) - 50)
 
             # -------- Filtro / Ordenação ----------
             if event == "-FILTER-":
@@ -680,11 +679,30 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
 
             # -------- Barra de ações ----------
             if event == "-LOGIN-":
-                cfg = _login_dialog()
-                if cfg:
-                    global G_SYBASE_CFG
-                    G_SYBASE_CFG = cfg
-                    sg.popup_ok("Credenciais aplicadas para esta sessão.")
+                # Primeiro tenta o login integrado (Empresa/Usuário/Estação) via Oracle
+                payload = show_login_baixa_integrada(window, default_usuario="RODOLFO")
+                if payload:
+                    G_EMPRESA_SEL = payload
+                    try:
+                        window.TKroot.title(f"Painel NFSe — Empresa: {payload.get('empresa_nome')}")
+                    except Exception:
+                        pass
+                    try:
+                        from infra.sybase import connect
+                        test_cfg = G_SYBASE_CFG or to_env_dict(SETTINGS.sybase)
+                        with connect(test_cfg) as con:
+                            cur = con.cursor()
+                            cur.execute("SELECT 1")
+                            cur.fetchall()
+                        sg.popup_no_wait("Conexão com o Domínio OK.", keep_on_top=True)
+                    except Exception as e:
+                        sg.popup_no_wait(f"Conexão com o Domínio falhou:\n{e}", keep_on_top=True)
+                else:
+                    # Fallback para o login manual original (mantido por compatibilidade)
+                    cfg = _login_dialog()
+                    if cfg:
+                        G_SYBASE_CFG = cfg
+                        sg.popup_ok("Credenciais aplicadas para esta sessão.")
 
             if event == "-EXP-HEAD-":
                 if not all_rows:
@@ -727,28 +745,26 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
             if event == "-IMP-NFS-":
                 if not all_rows:
                     sg.popup_error("Primeiro importe os XMLs para obter os números de NFSe.")
-                    continue
-
-                fonte = view_rows if view_rows else all_rows
-                numeros = sorted({(r.get("NFE") or "").strip() for r in fonte if (r.get("NFE") or "").strip()})
-                if not numeros:
-                    sg.popup_error("Nenhum número de NFSe disponível para pesquisa (verifique os dados carregados).")
-                    continue
-
-                try:
-                    dominio_rows = buscar_nfse_por_numeros(numeros, sybase_cfg=G_SYBASE_CFG)
-                    if not dominio_rows:
-                        sg.popup_ok("Nenhum registro retornado pelo Domínio para os números informados.")
+                else:
+                    fonte = view_rows if view_rows else all_rows
+                    numeros = sorted({(r.get("NFE") or "").strip() for r in fonte if (r.get("NFE") or "").strip()})
+                    if not numeros:
+                        sg.popup_error("Nenhum número de NFSe disponível para pesquisa (verifique os dados carregados).")
                     else:
-                        _show_nfse_dominio_window(dominio_rows, fonte)
-                except Exception as e:
-                    sg.popup_error(
-                        "Falha ao consultar NFS-e no Domínio.\n"
-                        "Dica: abra 'Login empresa', teste a conexão e aplique para esta sessão.\n\n"
-                        f"Erro: {e}\n\n"
-                        "Se as tabelas/colunas do seu Domínio forem diferentes, edite\n"
-                        "services/dominio_nfse.py (constantes TBL_NFSE/COL_*)."
-                    )
+                        try:
+                            dominio_rows = buscar_nfse_por_numeros(numeros, sybase_cfg=G_SYBASE_CFG)
+                            if not dominio_rows:
+                                sg.popup_ok("Nenhum registro retornado pelo Domínio para os números informados.")
+                            else:
+                                _show_nfse_dominio_window(dominio_rows, fonte)
+                        except Exception as e:
+                            sg.popup_error(
+                                "Falha ao consultar NFS-e no Domínio.\n"
+                                "Dica: abra 'Login empresa', teste a conexão e aplique para esta sessão.\n\n"
+                                f"Erro: {e}\n\n"
+                                "Se as tabelas/colunas do seu Domínio forem diferentes, edite\n"
+                                "services/dominio_nfse.py (constantes TBL_NFSE/COL_*)."
+                            )
 
             if event == "-GERA-PARC-":
                 if not view_rows:
@@ -757,7 +773,7 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
 
                 venc = _parcelas_dialog()
                 if not venc:
-                    continue  # cancelado
+                    continue
 
                 try:
                     a, p = aplicar_parcelas_e_acumuladores(view_rows, venc)
@@ -765,7 +781,6 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
                     sg.popup_error(f"Falha ao aplicar parcelas: {e}")
                     continue
 
-                # Reflete no conjunto completo (all_rows) por chave NFE+TOMADOR+EMISSAO
                 index_all = {(rr.get("NFE"), rr.get("TOMADOR"), rr.get("EMISSAO")): rr for rr in all_rows}
                 for rr in view_rows:
                     key = (rr.get("NFE"), rr.get("TOMADOR"), rr.get("EMISSAO"))
@@ -790,7 +805,6 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
                 except Exception as e:
                     sg.popup_error(f"Falha ao exportar:\n{e}")
 
-            # -------- Exportar CSV ----------
             if event == "-EXPORT-":
                 if not all_rows:
                     sg.popup_error("Nada para exportar. Carregue os dados primeiro.")
@@ -810,8 +824,7 @@ def main(input_path: Optional[str] = None, theme: Optional[str] = None) -> int:
 
         except Exception as e:
             from traceback import format_exc
-            from utils.logs import log_emit
-            log_emit(window["-LOG-"], "error", "excecao_na_ui", detalhe=str(e))
+            log_emit(SINK, "error", "excecao_na_ui", detalhe=str(e))
             sg.popup_error("Ocorreu um erro inesperado.\n\n" + str(e) + "\n\n" + format_exc())
 
     window.close()
