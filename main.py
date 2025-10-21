@@ -1,62 +1,106 @@
+# main.py
 from __future__ import annotations
 
-import argparse
+import os
 import sys
+import traceback
 from pathlib import Path
+from typing import Optional
 
 
-__version__ = "0.1.0"
+def _echo(msg: str) -> None:
+    print(msg, file=sys.stderr)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        prog="nfse-gui",
-        description="Painel visual para leitura e exportação de NFSe (ABRASF)"
-    )
-    ap.add_argument(
-        "--input",
-        help="Caminho inicial para carregar (pasta, .zip ou .xml). Opcional.",
-        default=None,
-    )
-    ap.add_argument(
-        "--theme",
-        help="Tema do PySimpleGUI (ex.: SystemDefault, DarkBlue3). Opcional.",
-        default=None,
-    )
-    return ap.parse_args(argv)
+def _load_env() -> None:
+    """
+    Carrega variáveis de ambiente a partir de:
+      1) config/.env   (PRIORITÁRIO, com override=True)
+      2) ./.env        (FALLBACK, sem override)
+    Depois, se ORACLE_CLIENT_LIB_DIR estiver definido, força ORACLE_MODE=thick.
+    """
+    # Caminhos baseados neste arquivo
+    base_dir = Path(__file__).resolve().parent
+    cfg_env = base_dir / "config" / ".env"
+    root_env = base_dir / ".env"
 
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-
-    # Import tardio para permitir mensagem amigável se o panel.py não existir
     try:
-        from panel import main as panel_main  # type: ignore
-    except Exception as exc:
-        sys.stderr.write(
-            "ERRO: não encontrei `panel.py` (ou houve falha ao importá-lo).\n"
-            "Crie o arquivo `panel.py` na mesma pasta deste `main.py` com a função "
-            "`main(input_path: str | None = None, theme: str | None = None) -> int`.\n"
-            f"Detalhes: {exc}\n"
-        )
-        return 1
+        from dotenv import load_dotenv  # type: ignore
 
-    # Normaliza o caminho de entrada (se fornecido)
-    input_path: str | None = None
-    if args.input:
-        input_path = str(Path(args.input))
+        # 1) Prioriza config/.env (override=True para garantir que os valores do projeto prevaleçam)
+        if cfg_env.exists():
+            load_dotenv(dotenv_path=cfg_env, override=True)
 
-    # Executa o painel e retorna o código de saída
+        # 2) Fallback: ./.env (apenas preenche o que faltar)
+        if root_env.exists():
+            load_dotenv(dotenv_path=root_env, override=False)
+
+    except Exception:
+        # Se python-dotenv não estiver instalado, apenas continua sem .env
+        pass
+
+    # Se tiver Instant Client configurado, padroniza thick (evita cair em thin por engano)
+    lib_dir = os.getenv("ORACLE_CLIENT_LIB_DIR")
+    if lib_dir:
+        os.environ["ORACLE_MODE"] = "thick"
+
+
+def _parse_args(argv: list[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Uso:
+      python main.py [INPUT_PATH] [--theme THEME]
+    """
+    input_path: Optional[str] = None
+    theme: Optional[str] = None
+
+    it = iter(argv[1:])
+    for token in it:
+        if token == "--theme":
+            try:
+                theme = next(it)
+            except StopIteration:
+                _echo("Parâmetro --theme sem valor. Ignorando.")
+            continue
+        # primeiro argumento posicional vira input_path
+        if input_path is None:
+            input_path = token
+        else:
+            _echo(f"Aviso: argumento ignorado: {token}")
+
+    # Se não veio tema por argumento, usa APP_THEME do .env (se houver)
+    theme = theme or os.getenv("APP_THEME")
+    return input_path, theme
+
+
+def main() -> int:
+    _load_env()
+
+    input_path, theme = _parse_args(sys.argv)
+
+    # Importa o painel e delega a execução
     try:
-        exit_code = int(panel_main(input_path=input_path, theme=args.theme))
-        return exit_code
-    except TypeError:
-        # Compat com versões antigas do panel.main sem kwargs
-        return panel_main(input_path, args.theme)  # type: ignore
-    except SystemExit as e:
-        return int(getattr(e, "code", 0))
+        import panel  # type: ignore
     except Exception as exc:
-        sys.stderr.write(f"ERRO em execução do painel: {exc}\n")
+        _echo("ERRO: não encontrei `panel.py` (ou houve falha ao importá-lo).")
+        _echo("Crie o arquivo `panel.py` na mesma pasta deste `main.py` com a função "
+              "`main(input_path: str | None = None, theme: str | None = None) -> int`.")
+        _echo(f"Detalhes: {exc}")
+        _echo(traceback.format_exc())
+        return 2
+
+    # Executa o painel
+    try:
+        rc = int(panel.main(input_path=input_path, theme=theme))  # type: ignore[attr-defined]
+        return rc
+    except SystemExit as se:
+        # Se o panel.py der sys.exit(...)
+        try:
+            return int(se.code) if se.code is not None else 0
+        except Exception:
+            return 1
+    except Exception as exc:
+        _echo(f"ERRO em execução do painel: {exc}")
+        _echo(traceback.format_exc())
         return 1
 
 
